@@ -27,7 +27,7 @@ pub mod pallet {
 		transaction_validity::{
 			InvalidTransaction, TransactionSource, TransactionValidity, ValidTransaction,
 		},
-		RuntimeDebug,
+		FixedU128, RuntimeDebug,
 	};
 	use sp_std::{collections::vec_deque::VecDeque, prelude::*, str};
 
@@ -46,8 +46,10 @@ pub mod pallet {
 	const UNSIGNED_TXS_PRIORITY: u64 = 100;
 
 	// We are fetching information from the github public API about organization`substrate-developer-hub`.
-	const HTTP_REMOTE_REQUEST: &str = "https://api.github.com/orgs/substrate-developer-hub";
-	const HTTP_HEADER_USER_AGENT: &str = "jimmychu0807";
+	const GITHUB_API_URL: &str = "https://api.github.com/orgs/substrate-developer-hub";
+	const GITHUB_API_USER_AGENT: &str = "jimmychu0807";
+
+	const DOT_PRICE_QUERY_URL: &str = "https://api.coincap.io/v2/assets/polkadot";
 
 	const FETCH_TIMEOUT_PERIOD: u64 = 3000; // in milli-seconds
 	const LOCK_TIMEOUT_EXPIRATION: u64 = FETCH_TIMEOUT_PERIOD + 1000; // in milli-seconds
@@ -89,6 +91,18 @@ pub mod pallet {
 	pub struct Payload<Public> {
 		number: u64,
 		public: Public,
+	}
+
+	#[derive(Encode, Decode, Clone, PartialEq, Eq, RuntimeDebug)]
+	pub struct PricePayload<Public> {
+		price: (u64, Permill),
+		public: Public,
+	}
+
+	impl<T: SigningTypes> SignedPayload<T> for PricePayload<T::Public> {
+		fn public(&self) -> T::Public {
+			self.public.clone()
+		}
 	}
 
 	impl<T: SigningTypes> SignedPayload<T> for Payload<T::Public> {
@@ -133,6 +147,13 @@ pub mod pallet {
 		}
 	}
 
+	#[derive(Deserialize, Encode, Decode, Default)]
+	#[serde(rename_all = "camelCase")]
+	struct DotPriceInfo {
+		#[serde(deserialize_with = "de_string_to_bytes")]
+		pub price_usd: Vec<u8>,
+	}
+
 	#[pallet::config]
 	pub trait Config: frame_system::Config + CreateSignedTransaction<Call<Self>> {
 		/// The overarching event type.
@@ -163,6 +184,7 @@ pub mod pallet {
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
 		NewNumber(Option<T::AccountId>, u64),
+		NewPrice((u64, Permill)),
 	}
 
 	// Errors inform users that something went wrong.
@@ -183,6 +205,9 @@ pub mod pallet {
 
 		// Error returned when fetching github info
 		HttpFetchingError,
+
+		// Failed to parse price value from API point
+		InvalidPriceValueError,
 	}
 
 	#[pallet::hooks]
@@ -250,6 +275,12 @@ pub mod pallet {
 					}
 					valid_tx(b"submit_number_unsigned_with_signed_payload".to_vec())
 				}
+				Call::submit_price_unsigned_with_signed_payload(ref payload, ref signature) => {
+					if !SignedPayload::<T>::verify::<T::AuthorityId>(payload, signature.clone()) {
+						return InvalidTransaction::BadProof.into();
+					}
+					valid_tx(b"submit_price_unsigned_with_signed_payload".to_vec())
+				}
 				_ => InvalidTransaction::Call.into(),
 			}
 		}
@@ -293,6 +324,31 @@ pub mod pallet {
 			Self::deposit_event(Event::NewNumber(None, number));
 			Ok(())
 		}
+
+		#[pallet::weight(10000)]
+		pub fn submit_price_unsigned_with_signed_payload(
+			origin: OriginFor<T>,
+			payload: PricePayload<T::Public>,
+			_signature: T::Signature,
+		) -> DispatchResult {
+			let _who = ensure_none(origin)?;
+			// we don't need to verify the signature here because it has been verified in
+			//   `validate_unsigned` function when sending out the unsigned tx.
+			let PricePayload { price, public } = payload;
+
+			log::info!("submit_price_unsigned_with_signed_payload: ({:?}, {:?})", price, public);
+
+			Prices::<T>::mutate(|prices| {
+				if prices.len() == NUM_VEC_LEN {
+					let _ = prices.pop_front();
+				}
+				prices.push_back(price);
+				log::info!("Prices vector: {:?}", prices);
+			});
+
+			Self::deposit_event(Event::NewPrice(price));
+			Ok(())
+		}
 	}
 
 	impl<T: Config> Pallet<T> {
@@ -308,20 +364,54 @@ pub mod pallet {
 			});
 		}
 
+		fn parse_float_part<F: str::FromStr>(value: &[u8]) -> Result<F, Error<T>> {
+			let part = str::from_utf8(value).map_err(|_| Error::<T>::InvalidPriceValueError)?;
+			part.parse::<F>().map_err(|_| Error::<T>::InvalidPriceValueError)
+		}
+
 		fn fetch_price_info() -> Result<(), Error<T>> {
-			// TODO: 这是你们的功课
+			// 採用了 unsigned tx with signed payload 這種方式
+			// 這樣保證信息的來源是合法的 ocw，同時也不用 ocw 因提供信息而付費
 
-			// 利用 offchain worker 取出 DOT 当前对 USD 的价格，并把写到一个 Vec 的存储里，
-			// 你们自己选一种方法提交回链上，并在代码注释为什么用这种方法提交回链上最好。只保留当前最近的 10 个价格，
-			// 其他价格可丢弃 （就是 Vec 的长度长到 10 后，这时再插入一个值时，要先丢弃最早的那个值）。
+			let signer = Signer::<T, T::AuthorityId>::any_account();
 
-			// 取得的价格 parse 完后，放在以下存儲：
-			// pub type Prices<T> = StorageValue<_, VecDeque<(u64, Permill)>, ValueQuery>
+			let mut lock = StorageLock::<BlockAndTime<Self>>::with_block_and_time_deadline(
+				b"offchain-demo::dot-price::lock",
+				LOCK_BLOCK_EXPIRATION,
+				rt_offchain::Duration::from_millis(LOCK_TIMEOUT_EXPIRATION),
+			);
 
-			// 这个 http 请求可得到当前 DOT 价格：
-			// [https://api.coincap.io/v2/assets/polkadot](https://api.coincap.io/v2/assets/polkadot)。
+			if lock.try_lock().is_err() {
+				return Ok(());
+			}
 
-			Ok(())
+			let dot_price_info: DotPriceInfo = Self::fetch_n_parse(DOT_PRICE_QUERY_URL)?;
+			let mut price_iter = dot_price_info.price_usd.split(|char| *char == '.' as u8);
+
+			let integer_part = Self::parse_float_part::<u64>(
+				price_iter.next().ok_or(<Error<T>>::InvalidPriceValueError)?,
+			)?;
+			let fractional_part = Self::parse_float_part::<u32>(
+				price_iter.next().ok_or(<Error<T>>::InvalidPriceValueError)?,
+			)?;
+			let fractional_part = Permill::from_parts(fractional_part);
+
+			if let Some((_, res)) = signer.send_unsigned_transaction(
+				|acct| PricePayload {
+					price: (integer_part, fractional_part),
+					public: acct.public.clone(),
+				},
+				Call::submit_price_unsigned_with_signed_payload,
+			) {
+				return res.map_err(|_| {
+					log::error!("Failed in offchain_unsigned_tx_signed_payload");
+					<Error<T>>::OffchainUnsignedTxSignedPayloadError
+				});
+			}
+
+			// The case of `None`: no account is available for sending
+			log::error!("No local account available");
+			Err(<Error<T>>::NoLocalAcctForSigning)
 		}
 
 		/// Check if we have fetched github info before. If yes, we can use the cached version
@@ -365,7 +455,7 @@ pub mod pallet {
 			// We try to acquire the lock here. If failed, we know the `fetch_n_parse` part inside is being
 			//   executed by previous run of ocw, so the function just returns.
 			if let Ok(_guard) = lock.try_lock() {
-				match Self::fetch_n_parse() {
+				match Self::fetch_n_parse::<GithubInfo>(GITHUB_API_URL) {
 					Ok(gh_info) => {
 						s_info.set(&gh_info);
 					}
@@ -378,8 +468,8 @@ pub mod pallet {
 		}
 
 		/// Fetch from remote and deserialize the JSON to a struct
-		fn fetch_n_parse() -> Result<GithubInfo, Error<T>> {
-			let resp_bytes = Self::fetch_from_remote().map_err(|e| {
+		fn fetch_n_parse<D: serde::de::DeserializeOwned>(url: &str) -> Result<D, Error<T>> {
+			let resp_bytes = Self::fetch_from_remote(url).map_err(|e| {
 				log::error!("fetch_from_remote error: {:?}", e);
 				<Error<T>>::HttpFetchingError
 			})?;
@@ -390,18 +480,18 @@ pub mod pallet {
 			log::info!("{}", resp_str);
 
 			// Deserializing JSON to struct, thanks to `serde` and `serde_derive`
-			let gh_info: GithubInfo =
+			let gh_info: D =
 				serde_json::from_str(&resp_str).map_err(|_| <Error<T>>::HttpFetchingError)?;
 			Ok(gh_info)
 		}
 
 		/// This function uses the `offchain::http` API to query the remote github information,
 		///   and returns the JSON response as vector of bytes.
-		fn fetch_from_remote() -> Result<Vec<u8>, Error<T>> {
-			log::info!("sending request to: {}", HTTP_REMOTE_REQUEST);
+		fn fetch_from_remote(url: &str) -> Result<Vec<u8>, Error<T>> {
+			log::info!("sending request to: {}", url);
 
 			// Initiate an external HTTP GET request. This is using high-level wrappers from `sp_runtime`.
-			let request = rt_offchain::http::Request::get(HTTP_REMOTE_REQUEST);
+			let request = rt_offchain::http::Request::get(url);
 
 			// Keeping the offchain worker execution time reasonable, so limiting the call to be within 3s.
 			let timeout = sp_io::offchain::timestamp()
@@ -410,7 +500,7 @@ pub mod pallet {
 			// For github API request, we also need to specify `user-agent` in http request header.
 			//   See: https://developer.github.com/v3/#user-agent-required
 			let pending = request
-				.add_header("User-Agent", HTTP_HEADER_USER_AGENT)
+				.add_header("User-Agent", GITHUB_API_USER_AGENT)
 				.deadline(timeout) // Setting the timeout time
 				.send() // Sending the request out by the host
 				.map_err(|_| <Error<T>>::HttpFetchingError)?;
